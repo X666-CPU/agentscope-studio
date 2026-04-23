@@ -1,13 +1,19 @@
 # AgentScope Studio - Multi-stage Dockerfile
 # 适用于 CI/CD (GitHub Actions) 完整构建
 
+# ===== 新增阶段：拉取完整源码（解决构建上下文问题） =====
+FROM node:22-alpine AS source-cloner
+WORKDIR /app
+RUN git clone https://github.com/X666-CPU/agentscope-studio.git /app
+
 # ===== Stage 1: 构建前端 =====
 FROM node:22-alpine AS client-builder
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-COPY packages/client ./packages/client
-COPY packages/shared ./packages/shared
+# 关键：从 source-cloner 阶段复制完整源码，而不是从构建上下文复制
+COPY --from=source-cloner /app/package.json /app/package-lock.json ./
+COPY --from=source-cloner /app/packages/client ./packages/client
+COPY --from=source-cloner /app/packages/shared ./packages/shared
 
 RUN npm config set registry https://registry.npmmirror.com
 RUN npm install
@@ -19,9 +25,10 @@ FROM node:22-alpine AS server-builder
 RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-COPY packages/server ./packages/server
-COPY packages/shared ./packages/shared
+# 同样从 source-cloner 复制源码
+COPY --from=source-cloner /app/package.json /app/package-lock.json ./
+COPY --from=source-cloner /app/packages/server ./packages/server
+COPY --from=source-cloner /app/packages/shared ./packages/shared
 
 RUN npm config set registry https://registry.npmmirror.com
 RUN npm install
@@ -34,18 +41,18 @@ RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 
-# 从构建阶段复制产物
+# 从构建阶段复制产物（不变）
 COPY --from=client-builder /app/packages/client/dist ./dist/public
 COPY --from=server-builder /app/packages/server/dist ./dist/server
 COPY --from=server-builder /app/packages/shared/dist ./dist/shared
 COPY --from=server-builder /app/node_modules ./node_modules
 COPY --from=server-builder /app/package.json ./package.json
 
-# 复制 Python app
-COPY packages/app ./dist/app
+# 复制 Python app（现在从 source-cloner 复制）
+COPY --from=source-cloner /app/packages/app ./dist/app
 
-# 路径别名处理
-COPY register-aliases.js ./
+# 路径别名处理（现在从 source-cloner 复制）
+COPY --from=source-cloner /app/register-aliases.js ./
 
 # 环境变量
 ENV NODE_ENV=production

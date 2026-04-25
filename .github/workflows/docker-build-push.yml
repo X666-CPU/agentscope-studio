@@ -1,128 +1,73 @@
-name: Docker Build and Push
+name: Build and Download AgentScope Studio Docker Image
 
 on:
-    release:
-        types: [published]
-
-env:
-    REGISTRY: docker.io
-    IMAGE_NAME: agentscope/studio
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages/**'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag'
+        required: false
+        default: 'latest'
 
 jobs:
-    docker-build-push:
-        runs-on: ubuntu-latest
-        timeout-minutes: 40
+  build-and-download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-            - name: Install docker-compose
-              run: |
-                  echo "📦 Installing docker-compose..."
-                  sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-                  sudo chmod +x /usr/local/bin/docker-compose
-                  docker-compose --version
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-            - name: Setup docker.sh
-              run: chmod +x docker/docker.sh
+      # 提取镜像标签（保留原有逻辑）
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: build-image
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=${{ github.event.inputs.tag || 'latest' }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-            - name: Get version from package.json
-              id: package_version
-              run: |
-                  PACKAGE_VERSION=$(node -p "require('./package.json').version")
-                  TAG="v${PACKAGE_VERSION}"
-                  echo "version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
-                  echo "tag=$TAG" >> $GITHUB_OUTPUT
-                  echo "📦 Package.json version: $PACKAGE_VERSION"
-                  echo "🏷️  Docker tag: $TAG"
+      # 构建 Docker 镜像（不推送，本地构建）
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false  # 关键：关闭推送
+          load: true   # 关键：加载到本地 Docker
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
 
-            - name: Get version from Release tag
-              id: release_version
-              run: |
-                  RELEASE_VERSION=${GITHUB_REF#refs/tags/v}
-                  echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
-                  echo "🏷️  Release tag version: $RELEASE_VERSION"
+      # 导出镜像为 tar 文件
+      - name: Export Docker image to file
+        run: |
+          # 获取第一个标签作为镜像名称
+          IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          # 保存镜像
+          docker save -o agentscope-studio-image.tar "$IMAGE_TAG"
+          
+          # 压缩镜像（减小体积）
+          gzip agentscope-studio-image.tar
+          echo "镜像已导出并压缩：agentscope-studio-image.tar.gz"
 
-            - name: Verify version consistency
-              run: |
-                  PACKAGE_V="${{ steps.package_version.outputs.version }}"
-                  RELEASE_V="${{ steps.release_version.outputs.version }}"
-                  if [ "$PACKAGE_V" != "$RELEASE_V" ]; then
-                    echo "::error::❌ Version mismatch! package.json: $PACKAGE_V, tag: $RELEASE_V"
-                    exit 1
-                  fi
-                  echo "✅ Version match: $PACKAGE_V"
-
-            - name: Build Docker image (docker.sh build)
-              run: |
-                  echo "🔨 Building Docker image..."
-                  ./docker/docker.sh build
-                  docker tag agentscope/studio:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.package_version.outputs.tag }}
-                  docker tag agentscope/studio:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-                  docker images
-
-            - name: Update docker-compose image
-              run: |
-                  sed -i "s|image: agentscope/studio:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest|g" docker/docker-compose.yml
-
-            - name: Start container (docker.sh start)
-              run: |
-                  echo "🚀 Starting container..."
-                  ./docker/docker.sh start
-                  sleep 10
-
-            - name: Check status (docker.sh status)
-              run: ./docker/docker.sh status
-
-            - name: Health check
-              run: |
-                  echo "🏥 Health check..."
-                  for i in {1..30}; do
-                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/trpc 2>/dev/null || echo "000")
-                    if [ "$HTTP_CODE" != "000" ]; then
-                      echo "✅ Service responding (HTTP $HTTP_CODE)"
-                      exit 0
-                    fi
-                    echo "Waiting... ($i/30)"
-                    sleep 2
-                  done
-                  echo "❌ Service not responding"
-                  exit 1
-
-            - name: Print container logs
-              if: always()
-              run: |
-                  echo "📋 Container logs:"
-                  docker-compose -f docker/docker-compose.yml logs --tail=100 || true
-
-            - name: Stop container (docker.sh stop)
-              if: always()
-              run: ./docker/docker.sh stop
-
-            - name: Login to Docker Hub
-              uses: docker/login-action@v3
-              with:
-                  registry: ${{ env.REGISTRY }}
-                  username: ${{ secrets.DOCKER_USERNAME }}
-                  password: ${{ secrets.DOCKER_TOKEN }}
-
-            - name: Push to Docker Hub
-              run: |
-                  TAG=${{ steps.package_version.outputs.tag }}
-                  echo "🚀 Pushing ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}..."
-                  docker push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
-                  docker push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-
-            - name: Success
-              run: |
-                  TAG=${{ steps.package_version.outputs.tag }}
-                  echo ""
-                  echo "╔════════════════════════════════════════════════════════════╗"
-                  echo "║  🎉  DOCKER PUSH SUCCESS                                    ║"
-                  echo "╠════════════════════════════════════════════════════════════╣"
-                  echo "║  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-                  echo "║  Tag:   ${TAG}"
-                  echo "║  URL:   https://hub.docker.com/r/${{ env.IMAGE_NAME }}"
-                  echo "╚════════════════════════════════════════════════════════════╝"
-                  echo ""
+      # 上传为构建产物，支持直接下载
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentscope-studio-docker-image
+          path: agentscope-studio-image.tar.gz
+          if-no-files-found: error
